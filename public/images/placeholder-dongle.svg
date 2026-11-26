@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" role="img" aria-label="USB receiver placeholder">
+  <rect width="240" height="240" rx="24" fill="#eef2f7"/>
+  <g stroke="#64748b" stroke-width="8" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M44 104h104l36 16v34l-36 16H44a12 12 0 0 1-12-12v-42a12 12 0 0 1 12-12Z" fill="#f8fafc"/>
+    <path d="M148 104v66" fill="none"/>
+    <path d="M184 120h16v28h-16" fill="#cbd5e1"/>
+    <path d="M76 118v38" fill="none"/>
+    <circle cx="96" cy="137" r="7" fill="#cbd5e1" stroke="none"/>
+  </g>
+</svg>

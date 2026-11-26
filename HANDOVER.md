@@ -1,0 +1,310 @@
+# MouseDongleFinder — AI Agent Handover Document
+
+Read this file first if you are continuing this project with another AI agent. It is the single source of
+truth for **what the app is, how it is built, what is deliberately out of scope, and how to verify changes**.
+
+Also read:
+- `AGENTS.md` / `CLAUDE.md` — Laravel Boost rules (authoritative for code style and tooling).
+- `RESEARCH.md` — technical research, comparison matrix, and engineering decisions.
+- `README.md` — end-user setup and usage.
+
+> **Security rule inherited from the global operator rules:** never access any production VPS or any
+> credential belonging to another project (not even read-only). Production changes are performed by the
+> admin running commands you write down. Never print or commit `.env` values, passwords, or keys.
+
+---
+
+## 1. What this application is
+
+A single-purpose local web app for an office problem: many wireless mouse USB dongles got mixed up and
+nobody knows which dongle belongs to which mouse. The app lets the user record mice and dongles (with
+photos and physical descriptions), investigate unknown receivers (USB scan → hardware IDs → local
+VID/PID database → online research → official software discovery), and then record a **manually verified**
+mouse↔dongle relationship.
+
+Core workflow:
+
+```
+connect → USB scan → identify → online research → find software → physical test → confirm match
+```
+
+### Strict scope (do not expand)
+✅ mice, dongles, matching, USB detective, receiver identification, research links, software/downloads, photos/OCR
+❌ employee/HR management, general IT asset management, ticketing, procurement, finance, complex roles/permissions,
+QR codes, enterprise reporting, background monitoring daemons
+
+The UI must stay focused, small, and practical.
+
+---
+
+## 2. Stack and versions (verify before relying on APIs)
+
+| Layer | Technology | Version (as of 2026-11-21) |
+|---|---|---|
+| Backend | Laravel | 13.x (`composer show laravel/framework`) |
+| Language | PHP | 8.3 |
+| Database | SQLite | `database/database.sqlite` |
+| Frontend | Vue 3 + vue-router 4 + Pinia | see `package.json` |
+| Build | Vite 8 + `@vitejs/plugin-vue` | see `package.json` |
+| Styling | Tailwind CSS v4 (`@import "tailwindcss"`) | see `package.json` |
+| Icons | `lucide-vue-next` | see `package.json` |
+| HTTP client | axios (`baseURL = '/api'`) | see `package.json` |
+| Testing | PHPUnit 12 (`php artisan test`) | see `composer.json` |
+
+No auth is wired up. This is a local single-user tool. Do not add a full auth/roles system.
+
+---
+
+## 3. Directory map
+
+```
+app/
+  Http/Controllers/Api/     JSON API controllers (Dashboard, Mouse, Dongle, DeviceMatch,
+                            UsbScan, Identification, Download, UsbId, Research)
+  Models/                   Eloquent models (Mouse, Dongle, DeviceMatch, Identification,
+                            Download, UsbScan, UsbVendor, UsbProduct, MouseProfile, MatchingSession,
+                            DevicePhoto (polymorphic reference gallery))
+  Services/                 Custom engineering core:
+                              UsbDeviceScanner     PowerShell scan wrapper (Windows; PnP properties)
+                              LivePairingDetector  live HID/mouse detection grouped per receiver
+                              DongleLabService    batch session: label all dongles + observe new devices
+                              Concerns/RunsWindowsProcess  shared env-cleaning child-process runner
+                              UsbIdDatabase        usb.ids import/lookup
+                              IdentificationEngine evidence + confidence pipeline
+                              WebResearchService   configurable search + official links
+                              DownloadService      safe HTTPS download + SHA-256
+                              ImageAnalysisService optional OCR
+  Providers/                AppServiceProvider (kept minimal)
+bootstrap/app.php           Laravel bootstrap; `api` middleware applied here (do not re-apply in routes)
+config/, database/          config + migrations, factories, seeders
+database/database.sqlite    LOCAL database (persistent; do not delete)
+downloads/                  downloaded drivers/manuals/utilities, grouped by manufacturer/model
+resources/
+  js/app.js                 Vue bootstrap, axios, CSRF interceptor
+  js/App.vue                sidebar shell + <router-view>
+  js/router/index.js        routes
+  js/views/*.vue            10 pages (incl. DongleLab.vue)
+  js/components/*.vue       reusable UI components
+  js/composables/useToast.js, useConfirm.js, useFormat.js
+  css/app.css               Tailwind v4 entry
+  ps/scan-usb.ps1           Windows USB enumeration script (rich details)
+  ps/scan-connected-mice.ps1  fast PnP enumeration for Live Pairing
+  views/app.blade.php       SPA entry — MUST use @vite(['resources/js/app.js'])
+public/
+  build/                    Vite output (regenerated by npm run build)
+  images/placeholder-*.svg  default photos
+  storage -> ../storage/app/public   (created by `php artisan storage:link`)
+RESEARCH.md                 research + engineering decisions
+HANDOVER.md                 this file
+README.md                   end-user setup and feature list
+USER_GUIDE.md               step-by-step usage incl. live dongle→mouse workflow
+API.md                      every endpoint, params and response shapes
+DATABASE.md                 schema, relations, ID formats, seed policy
+TESTING.md                  full test inventory and commands
+TROUBLESHOOTING.md          common Windows/PHP/Vite/USB issues
+```
+
+---
+
+## 4. Data model (SQLite)
+
+| Table | Purpose | Important columns |
+|---|---|---|
+| `mice` | Registered mice | `mouse_id` (auto `MS-XXXXXXXX`), brand (required), model, color, physical_description, connectivity_type, photo_path, notes, `is_seed` |
+| `dongles` | Registered receivers | `dongle_id` (auto `DG-XXXXXXXX`), brand/model **nullable** (unknown dongles allowed), color, physical_description, receiver_type, photo_path, notes, vid, pid, hardware_id, serial_number, `is_seed` |
+| `device_matches` | Mouse↔dongle relationship | mouse_id FK, dongle_id FK, status enum(`matched`,`suspected`,`unmatched`,`unknown`), notes, matched_at, `is_seed` |
+| `usb_scans` | Scan history | scan_id, devices JSON, device_count, scanned_at, scanned_by, `is_seed` |
+| `identifications` | Research results for a dongle | vid, pid, hardware_id, probable_manufacturer, probable_model, device_category, wireless_technology, frequency, receiver_family, compatible_mice JSON, pairing_utility, official_support_url, evidence JSON, confidence, research_sources JSON, notes, `is_seed` |
+| `identification_photos` | Photo/OCR workspace (if present) | identification_id, dongle_id, path, photo_type, extracted_text |
+| `downloads` | Download history | filename, file_path, source_url, source_type(official/third-party/unknown), manufacturer, model, software_type, file_size, sha256_hash, download_status, downloaded_at, `is_seed` |
+| `usb_vendors`, `usb_products` | Local VID/PID decode | UPPERCASE vid/pid; seeded curated rows + optional usb.ids import |
+| `mouse_profiles` | Reference model→wireless VID/PID data used by Live Pairing | brand, model, vid, pid, receiver_family, wireless_technology, frequency, pairing_utility, official_support_url, notes, source; unique (brand, model) |
+| `users`, `cache*`, `jobs*` | Laravel defaults | unused by app logic |
+
+`is_seed = true` marks **development sample data** only. Real user entries are `false`. The app must work
+with an empty database — never treat seed rows as real data. The seed catalogue is a **global researched
+reference**: 47 brands, 91 mouse profiles, 65 mice, 56 dongles, 52 identifications, 3,427 USB vendors,
+2,878 filtered USB products and 10 clearly-labelled sample matches, sourced from `usb.ids` 2026.06.26
+(snapshot committed at `database/seeders/usb-ids-snapshot.php`) plus official vendor pages. It is still a
+catalogue, not the user's office inventory.
+
+### Matching invariants (enforce in the backend, not only UI)
+- Status `matched` = physically tested and confirmed working.
+- Status `suspected` = possible match, not verified.
+- Status `unmatched` / `unknown` = no confirmed relationship.
+- A dongle cannot be in an **active** (`matched` or `suspected`) relationship with more than one mouse,
+  and a mouse cannot be in an active relationship with more than one dongle. Use nested `where` closures
+  for the duplicate query (a flat `where()->orWhere()->whereIn()` has wrong SQL precedence).
+- Never infer compatibility from the same brand or the same radio frequency; the user performs the physical test.
+- Removing a match returns both devices to the appropriate unmatched state (the `match` relation simply disappears).
+- Dashboard statistics must be computed from the database, never hardcoded.
+
+---
+
+## 5. API contract (axios base `/api`)
+
+All list endpoints return Laravel paginator JSON: `{data, current_page, last_page, per_page, total, from, to}`.
+Single models include `photo_url` and `device_match_status` accessors, plus eager-loaded `reference_photos`
+(array of `{id, photo_type, caption, path, url, source_url, source_name, is_seed}`). Mouse/dongle lists are
+ordered by reference-photo count descending so devices with real example images appear first.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/dashboard` | `{stats, recent_mice, recent_dongles, recent_matches, status_overview}` |
+| GET/POST | `/mice` | search, brand, status filters; multipart for photo |
+| GET/POST(_method=PUT)/DELETE | `/mice/{mouse}` | full CRUD |
+| GET/POST | `/dongles` | search, brand, status (`unmatched` supported) filters |
+| GET/POST(_method=PUT)/DELETE | `/dongles/{dongle}` | full CRUD |
+| GET/POST | `/matches` | POST body `{mouse_id, dongle_id, status, notes}` → 201 or 422 `{error, existing_match}` |
+| GET/POST(_method=PUT)/DELETE | `/matches/{match}` | status/notes edits, removal |
+| GET/POST | `/usb-scans` | POST performs a real Windows scan and stores it |
+| POST | `/usb-scans/scan` | `{save:false}` → `{devices, count, scanned_at, error?}` |
+| POST | `/usb-scans/live-match` | **Live Pairing**: reads Windows HID/mouse devices, groups them per receiver, returns `{dongles:[{vid,pid,name,dongle_id,connected_devices,suggestions}], unattributed_devices, error, message}`. Never saves a match; UI uses `POST /matches` after confirmation |
+| POST | `/auto-discover` | One-click discovery: reads Windows HID connections, identifies the mouse from `mouse_profiles`/device names, auto-registers missing mice/dongles, auto-saves a **suspected** match when evidence is strong. Returns `{discovered:[{dongle,device,identity,mouse,match,evidence,needs_user_review}],unattributed_devices,error,message}` |
+| GET/POST | `/matching-sessions` | **Dongle Lab** batch session. POST scans all plugged dongles and labels them A/B/C with brand guess, USB port, confidence and `matched_mice` (recorded relationships; same-VID:PID ones flagged `match_source: 'same_vid_pid_family'`) |
+| GET/POST | `/matching-sessions/{id}`, `/observe` | Observe after switching one mouse on (accept `dongle_key`); returns `connected_devices` (all current mouse devices with `is_new`), `new_devices`, grouped `candidates`, `flat_candidates`, `tested_dongle_key`. Persists snapshot. No auto-save |
+| POST | `/matching-sessions/{id}/label` | Manually label a dongle (`dongle_key`, `brand`, `model`) when VID/PID cannot identify the brand; sets `brand_source: 'manual'` |
+| POST / DELETE | `/matching-sessions/{id}/complete`, `/matching-sessions/{id}` | Finish or delete a batch session |
+| GET/DELETE | `/usb-scans/{usb_scan}` | history detail/removal |
+| GET/POST | `/identifications` | saved research records |
+| POST | `/identifications/analyze` | the identification engine (evidence-based result) |
+| POST | `/identifications/{id}/save-analysis` | persist an analysis |
+| POST | `/identifications/ocr` | multipart photo OCR (may report `available:false`) |
+| GET | `/usb-ids/lookup?vid=&pid=` | local decode |
+| POST | `/usb-ids/refresh` | download + parse `usb.ids` |
+| POST | `/research/search` | configurable search API or honest official-link fallback |
+| GET | `/research/software` | official drivers/pairing tools by manufacturer/model |
+| GET/DELETE | `/downloads`, `/downloads/{download}` | history |
+| POST | `/downloads/fetch` | safe download; executables need `confirmed:true` |
+| GET | `/downloads/{id}/verify` | recompute SHA-256 |
+| POST | `/downloads/{id}/open` | open folder in Explorer (no file execution) |
+
+Keep these response keys stable — the Vue components depend on them. See `RESEARCH.md` §3 for the full
+identification result shape (evidence, candidates, unknowns, confidence, etc.).
+
+---
+
+## 6. Development workflow
+
+### One-time setup (Windows)
+```powershell
+cd C:\Projects\MouseDongleFinder
+composer install
+copy .env.example .env
+php artisan key:generate
+
+# Enable the fileinfo extension in the PHP ini that `php --ini` reports
+# (Composer otherwise refuses to install/update packages). If you cannot edit
+# Program Files, use: composer <command> --ignore-platform-req=ext-fileinfo
+
+php artisan migrate --force
+php artisan db:seed --class=DatabaseSeeder   # OPTIONAL development sample data
+php artisan storage:link
+npm install
+npm run build
+composer run dev        # Laravel server + Vite + logs, or: php artisan serve
+```
+
+### Daily loop
+```powershell
+php artisan test --compact
+vendor/bin/pint --dirty --format agent
+npm run build
+```
+
+### Testing environment
+`phpunit.xml` uses SQLite `:memory:` with `RefreshDatabase`. Tests must never touch the real
+`database/database.sqlite` or the real `downloads/` folder. Mock `UsbDeviceScanner` and
+`LivePairingDetector` in tests — never require real hardware. Use `Storage::fake('public')` for photos,
+`Http::fake()` + `Http::preventStrayRequests()` for research/id-refresh/downloads.
+
+### Test suite
+`132 tests / 1,315 assertions`, all passing. Full per-file inventory is in `TESTING.md`. Coverage includes
+mouse/dongle CRUD, search, photos, matching + duplicate guard, dashboard, every API endpoint
+(usb-scans incl. live-match, Dongle Lab sessions/observe, identifications, usb-ids, research, downloads),
+validation contracts, and seeder integrity. Do not claim a test passed unless you ran it.
+
+---
+
+## 7. How to use the main features (for verification)
+
+1. **Dashboard** — verify the four headline numbers change after adding/deleting devices or matches.
+2. **Mouse / Dongle Database** — add with optional photo, search by ID/brand/model, edit, delete with
+   confirmation. Unknown-brand dongles must be saveable with only an ID.
+3. **Matching Center** — pick one mouse and one dongle, perform the physical test outside the app, then
+   record `matched` / `suspected` / `unmatched` / `remove`. Try assigning the same dongle to a second
+   mouse while it is active — the backend must return 422 and the UI must show the existing match.
+4. **Match List** — search/filter, edit notes, remove.
+5. **USB Detective / Live Pairing (primary workflow)** — register mice with brand + model only; plug a
+   dongle, switch the mouse on, click *Detect connected mice*. Windows-reported HID devices are grouped
+   per receiver (shared VID:PID / composite topology) and matched to registered mice with evidence and
+   confidence. Register an unknown receiver inline if needed, then *Save as Suspected* or *Confirm Match*.
+   Nothing is auto-saved. A generic "HID-compliant mouse" is reported honestly as low confidence.
+6. **USB Detective / investigation** — click *SCAN USB DEVICES*. Real devices from the Windows PnP
+   database appear with VID/PID and driver metadata. Select a receiver candidate → *Analyze* →
+   *Identify Online* → review evidence/confidence/unknowns → *Register Device* → optionally upload
+   photos/OCR → find software → download with explicit confirmation → verify/open folder.
+7. **Software & Downloads** — URL and official/third-party badge are shown before download; `.exe`/`.msi`
+   require extra confirmation; nothing is executed automatically.
+
+---
+
+## 8. Conventions for AI agents
+
+- Follow `AGENTS.md` (Boost rules): `php artisan make:* --no-interaction`, explicit PHP types, curly braces
+  for all control structures, descriptive names, API resources where appropriate, no new dependencies without approval.
+- Before editing a file, check sibling files and reuse existing components/services.
+- PHP changes → run `vendor/bin/pint --dirty --format agent`.
+- Frontend changes → run `npm run build`; if a Vite manifest error appears, rebuild assets.
+- Tests are the verification mechanism — prefer a feature test over ad-hoc tinker scripts.
+- Use `php artisan route:list`, `php artisan config:show <key>` and Boost tools for inspection.
+- Documentation files: only create/update them when the operator asks (this one was asked for).
+- Do not invent data, scan results, search results, OCR output, or confidence. When a capability is
+  unavailable, the UI/API must say so explicitly.
+- Never execute downloaded files or change Windows security settings.
+
+---
+
+## 9. Known gotchas / limitations
+
+- **PHP `fileinfo`**: Composer requires it; system php.ini may need the extension enabled (admin rights).
+  Workaround flag documented above.
+- **PowerShell scan**: works for present devices without admin rights; driver metadata comes from
+  `Get-PnpDeviceProperty` (`DEVPKEY_Device_Driver*`), not WMI CIM (which hangs from the PHP process).
+  Serial numbers are only shown when the hardware reports them. Laravel `.env` variables are temporarily
+  removed from the child environment because PowerShell 5.1 otherwise fails with 0x8009001d.
+  A scan takes roughly 8-10 seconds; the UI shows a loading state. Non-Windows hosts get a structured error.
+- **Live Pairing** uses a separate fast PnP scan (~2 s) that reads VID/PID from instance IDs only; it does
+  not call `Get-PnpDeviceProperty`. Only receivers **present in the current scan** are shown — registered
+  sample dongles that are not plugged in never appear. Intel Bluetooth/sensor devices are excluded.
+  A composite USB device with HID children is treated as a receiver candidate. Generic HID labels produce
+  low-confidence suggestions that require manual registration. Never auto-create a match from this endpoint.
+- **VID/PID is a family identifier**, not a unique serial. Identical dongles cannot be distinguished electronically.
+- **Receiver ecosystems**: Logitech Unifying/Bolt/Lightspeed, Razer, Microsoft families are curated in the
+  engine; unknown vendors remain `unknown` rather than guessed.
+- **`usb.ids`** is community data and incomplete; refresh requires internet; offline curated rows always work.
+- **Web research**: no scraping of Google/Bing. Default is a real keyless Wikipedia MediaWiki search
+  (with simplified query fallbacks) plus official direct links; `RESEARCH_API_URL` + `RESEARCH_API_KEY`
+  optionally add a broader API. `available:false` only when every search source fails.
+- **OCR**: requires `OCR_SERVICE_URL` (optional `OCR_API_KEY`) or Tesseract on PATH; otherwise `available:false`.
+- **Downloads**: capped at 50 MB, HTTPS only, explicit confirmation for executables. Files never auto-run.
+- SQLite file and `downloads/` are local and persistent — back them up together.
+- `public/storage` symlink must exist for uploaded photos; recreate with `php artisan storage:link`.
+
+---
+
+## 10. Change log of this handover
+
+- 2026-11-21 — Initial handover created alongside the custom implementation; research recorded in `RESEARCH.md`.
+- 2026-11-22 — Added Live Pairing Detector (`mouse_profiles`, `POST /usb-scans/live-match`, fast PnP
+  script, UI panel with inline receiver/mouse registration); replaced sample seed data with a researched
+  real-world reference catalogue (19 brands); expanded documentation and the suite to 109 tests.
+- 2026-11-22 — Added the Dongle Lab batch workflow (`matching_sessions`, `DongleLabService`,
+  `MatchingSessionController`, `/dongle-lab` page): scan all plugged dongles, label them by USB port,
+  observe one mouse at a time, then save through the normal match endpoint. Suite now 132 tests.
+- 2026-11-22 — Dongle Lab rework: observe now reports ALL currently connected mouse devices (not just
+  newly appeared ones), accepts `dongle_key` so a user-declared dongle under test yields an actionable
+  candidate, adds manual brand labelling, and adds a global usb.ids-derived seed catalogue.
+- 2026-11-22 — Added polymorphic `device_photos` galleries with 429 locally stored real product images
+  across 116/121 sample devices (Commons + official galleries + Yandex Images), with captions, photo types
+  and source URLs; mouse/dongle lists sort devices with photos first.
